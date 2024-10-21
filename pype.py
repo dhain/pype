@@ -37,43 +37,73 @@ class ShutdownError(Exception):
     pass
 
 
+class Interruptor:
+    def __init__(self, cond):
+        self.cond = cond
+        self.cond.acquire()
+
+    def __enter__(self):
+        self.cond.wait()
+
+    def __exit__(self, typ, val, tb):
+        self.cond.release()
+
+
 class IOThread(threading.Thread):
     def __init__(self):
         super().__init__()
-        self.shutdown_r, self.shutdown_w = os.pipe()
-        self.shutdown_w = os.fdopen(self.shutdown_w, 'wb')
+        self.shutdown = False
+        self.int_r, self.int_w = os.pipe()
+        self.int_w = os.fdopen(self.int_w, 'wb')
+        self.int_cond = threading.Condition()
         self.selector = selectors.DefaultSelector()
         self.selector.register(
-            self.shutdown_r, selectors.EVENT_READ, self.do_shutdown)
+            self.int_r, selectors.EVENT_READ, self.do_interrupt)
 
-    def do_shutdown(self, key):
-        w = self.shutdown_w
-        self.shutdown_w = None
-        self.shutdown_r = None
-        w.close()
-        try:
-            os.read(key.fd, 512)
-        except Exception:
-            pass
-        try:
+    def interrupt(self, wait=True):
+        i = Interruptor(self.int_cond) if wait else None
+        if self.int_w:
+            print(f'{threading.get_ident()}: INTERRUPTING {type(self).__name__}({self.ident}) {i}', file=sys.stderr)
+            self.int_w.write(b'x')
+            self.int_w.flush()
+        return i
+
+    def do_interrupt(self, key):
+        with self.int_cond:
+            print(f'{type(self).__name__}({self.ident}): INTERRUPTED', file=sys.stderr)
+            try:
+                os.read(key.fd, 1)
+            except Exception:
+                pass
+            self.int_cond.notify_all()
+
+        if self.shutdown:
+            w = self.int_w
+            self.int_w = None
+            self.int_r = None
+            w.close()
             os.close(key.fd)
-        except Exception:
-            pass
-        self.selector.unregister(key.fd)
-        return True
+            self.selector.unregister(key.fd)
 
     def close(self):
-        if self.shutdown_w:
-            self.shutdown_w.write(b'x')
-            self.shutdown_w.flush()
+        print(f'{threading.get_ident()}: closing {type(self).__name__}({self.ident})', file=sys.stderr)
+        if not self.shutdown:
+            self.shutdown = True
+            self.interrupt(False)
 
     def run(self):
         with self.selector:
-            while self.selector.get_map():
+            while not self.shutdown and self.selector.get_map():
                 for key, event in self.selector.select():
-                    if key.data(key):
-                        self.close()
-                        return
+                    events = []
+                    if event & selectors.EVENT_READ:
+                        events.append('r')
+                    if event & selectors.EVENT_WRITE:
+                        events.append('w')
+                    events = ''.join(events)
+                    print(f'{type(self).__name__}({self.ident}): {key.fd}: {events}', file=sys.stderr)
+                    key.data(key)
+        print(f'{type(self).__name__}({self.ident}): exit', file=sys.stderr)
 
     def __enter__(self):
         self.start()
@@ -105,10 +135,18 @@ class ReadThread(IOThread):
         self.fd_to_sid[w] = sid
         return os.fdopen(r, *args, **kwargs)
 
+    def set_stream(self, sid, fileobj):
+        if sid in self.sid_to_fd:
+            raise ValueError('stream already open')
+        fd = fileobj if isinstance(fileobj, int) else fileobj.fileno()
+        self.sid_to_fd[sid] = fd
+        self.fd_to_sid[fd] = sid
+
     def read_chunk_header(self, key):
         data = os.read(key.fd, CHUNK.size - len(self.buf))
         if not data:
-            return True
+            self.close()
+            return
         self.buf += data
         if len(self.buf) < CHUNK.size:
             return
@@ -129,7 +167,8 @@ class ReadThread(IOThread):
     def read_chunk(self, key):
         data = os.read(key.fd, self.size - len(self.buf))
         if not data:
-            return True
+            self.close()
+            return
         self.buf += data
         if len(self.buf) < self.size:
             return
@@ -165,19 +204,6 @@ class ReadThread(IOThread):
             self.fd, selectors.EVENT_READ, self.read_chunk_header)
 
 
-class WritePipe:
-    def __init__(self, event, f):
-        self._event = event
-        self._f = f
-
-    def write(self, *args, **kwargs):
-        self._event.clear()
-        self._f.write(*args, **kwargs)
-
-    def __getattr__(self, attr):
-        return getattr(self._f, attr)
-
-
 class WriteThread(IOThread):
     maxread = 1024
     maxwrite = 10240
@@ -192,8 +218,7 @@ class WriteThread(IOThread):
         self.buf = b''
         self.write_enabled = False
         self.read_enabled = True
-        self.flushed = threading.Event()
-        self.flushed.set()
+        self.flush_cond = threading.Condition()
 
     def open(self, sid, *args, **kwargs):
         if sid in self.sid_to_fd:
@@ -201,13 +226,24 @@ class WriteThread(IOThread):
         r, w = os.pipe()
         self.sid_to_fd[sid] = r
         self.fd_to_sid[r] = sid
-        self.selector.register(
-            r, selectors.EVENT_READ, self.read_chunk)
-        writer = self.reader_to_writer[r] = WritePipe(
-            self.flushed, os.fdopen(w, *args, **kwargs))
+        with self.interrupt():
+            self.selector.register(
+                r, selectors.EVENT_READ, self.read_chunk)
+        writer = self.reader_to_writer[r] = os.fdopen(w, *args, **kwargs)
         return writer
 
+    def set_stream(self, sid, fileobj):
+        if sid in self.sid_to_fd:
+            raise ValueError('stream already open')
+        fd = fileobj if isinstance(fileobj, int) else fileobj.fileno()
+        self.sid_to_fd[sid] = fd
+        self.fd_to_sid[fd] = sid
+        with self.interrupt():
+            self.selector.register(
+                fd, selectors.EVENT_READ, self.read_chunk)
+
     def read_chunk(self, key):
+        print('READ', file=sys.stderr)
         try:
             sid = self.fd_to_sid[key.fd]
         except KeyError:
@@ -216,6 +252,7 @@ class WriteThread(IOThread):
         if data:
             self.buf += CHUNK.pack(sid, len(data)) + data
         else:
+            print('CLOSE', file=sys.stderr)
             self.buf += CHUNK.pack(sid, 0)
             fd = self.sid_to_fd.pop(sid)
             del self.fd_to_sid[fd]
@@ -235,7 +272,8 @@ class WriteThread(IOThread):
             self.enable_read()
         if self.buf:
             return
-        self.flushed.set()
+        with self.flush_cond:
+            self.flush_cond.notify_all()
         self.write_enabled = False
         self.selector.unregister(key.fd)
 
@@ -256,7 +294,8 @@ class WriteThread(IOThread):
                 self.fd, selectors.EVENT_WRITE, self.write_chunk)
 
     def flush(self):
-        self.flushed.wait()
+        with self.flush_cond:
+            self.flush_cond.wait()
 
     def __exit__(self, typ, val, tb):
         for writer in self.reader_to_writer.values():
@@ -269,8 +308,10 @@ if __name__ == '__pype__':
     sys.argv.pop(0)
     with WriteThread(sys.stdout) as writer:
         sys.stdout = writer.open(1, 'w')
-        print('hello world!')
-    #load_module('__main__', sys.argv[0])
+        with ReadThread(sys.stdin) as reader:
+            sys.stdin = reader.open(0, 'r')
+            msg = sys.stdin.read()
+            print(f'hello: {msg}')
 
 
 elif __name__ == '__main__':
@@ -324,7 +365,9 @@ elif __name__ == '__main__':
         p.stdin.write(PYPE)
         p.stdin.flush()
         with ReadThread(p.stdout) as reader:
-            stdout = reader.open(1, 'r')
-            print(f'from child: {stdout.read().strip()}')
+            reader.set_stream(1, sys.stdout)
+            with WriteThread(p.stdin) as writer:
+                writer.set_stream(0, sys.stdin)
+                writer.join()
 
     sys.exit(p.returncode)
