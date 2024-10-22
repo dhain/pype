@@ -149,12 +149,12 @@ class ReadThread(IOThread):
         if self.size == 0:
             try:
                 sfd = self.sid_to_fd[self.sid]
-                os.close(sfd)
             except KeyError:
                 pass
             else:
-                del self.sid_to_fd[self.sid]
+                os.close(sfd)
                 del self.fd_to_sid[sfd]
+                del self.sid_to_fd[self.sid]
                 if not self.sid_to_fd:
                     self.close()
                     return
@@ -306,13 +306,78 @@ class WriteThread(IOThread):
 
 
 if __name__ == '__pype__':
+    from importlib.abc import MetaPathFinder, Loader
+    from importlib.util import decode_source, module_from_spec
+    from importlib.machinery import ModuleSpec
+
+
+    class RemoteImporter(MetaPathFinder, Loader):
+        sid = 250
+
+        def __init__(self, reader, writer):
+            self.in_stream = reader.open(self.sid, 'rb')
+            self.out_stream = writer.open(self.sid, 'wb')
+            self.modules = {}
+            self.lock = threading.Lock()
+
+        def _read_source(self, fullname):
+            self.out_stream.write(f'{fullname}\n'.encode('utf-8'))
+            self.out_stream.flush()
+            line = self.in_stream.readline()
+            if not line:
+                self.out_stream.close()
+                return None
+            try:
+                remaining = int(line.strip())
+            except ValueError:
+                self.out_stream.close()
+                return None
+            buf = b''
+            while remaining:
+                chunk = self.in_stream.read(remaining)
+                if not chunk:
+                    self.out_stream.close()
+                    return None
+                remaining -= len(chunk)
+                buf += chunk
+            if buf:
+                return decode_source(buf)
+
+        def find_spec(self, fullname, path, target=None):
+            try:
+                source = self.modules[fullname]
+            except KeyError:
+                with self.lock:
+                    source = self.modules[fullname] = self._read_source(fullname)
+            if source:
+                return ModuleSpec(fullname, self)
+
+        def exec_module(self, module):
+            fullname = module.__name__
+            source = self.modules[fullname]
+            compiled = compile(source, f'<remote: {fullname}>', 'exec')
+            exec(compiled, module.__dict__)
+
+        def exec_main(self):
+            spec = self.find_spec('__main__', None)
+            module = module_from_spec(spec)
+            self.exec_module(module)
+
+        def close(self):
+            self.out_stream.close()
+            self.in_stream.close()
+
+
     sys.argv.pop(0)
     with WriteThread(sys.stdout) as writer:
         sys.stdout = writer.open(1, 'w')
         with ReadThread(sys.stdin) as reader:
             sys.stdin = reader.open(0, 'r')
-            msg = sys.stdin.read().strip()
-            print(f'hello: {msg}')
+            importer = RemoteImporter(reader, writer)
+            sys.meta_path.append(importer)
+            importer.exec_main()
+            importer.close()
+            reader.close()
         sys.stdout.close()
 
 
@@ -359,6 +424,32 @@ elif __name__ == '__main__':
     with opts.prog:
         prog = opts.prog.read()
 
+
+    class ImportResponder:
+        sid = 250
+
+        def __init__(self, reader, writer, modules):
+            self.in_stream = reader.open(self.sid, 'rb')
+            self.out_stream = writer.open(self.sid, 'wb')
+            self.modules = modules
+
+        def run(self):
+            try:
+                while True:
+                    fullname = self.in_stream.readline()
+                    if not fullname:
+                        return
+                    fullname = fullname.decode('utf-8').strip()
+                    source = self.modules.get(fullname, b'')
+                    self.out_stream.write(f'{len(source)}\n'.encode('utf-8'))
+                    if source:
+                        self.out_stream.write(source)
+                    self.out_stream.flush()
+            finally:
+                self.out_stream.close()
+                self.in_stream.close()
+
+
     with subprocess.Popen(
         [opts.ssh, opts.connect, cmd],
         stdin=subprocess.PIPE,
@@ -370,5 +461,9 @@ elif __name__ == '__main__':
             reader.set_stream(1, sys.stdout)
             with WriteThread(p.stdin) as writer:
                 writer.set_stream(0, sys.stdin)
+                ImportResponder(reader, writer, {
+                    '__main__': prog,
+                }).run()
+                writer.close()
 
     sys.exit(p.returncode)
