@@ -63,14 +63,12 @@ class IOThread(threading.Thread):
     def interrupt(self, wait=True):
         i = Interruptor(self.int_cond) if wait else None
         if self.int_w:
-            print(f'{threading.get_ident()}: INTERRUPTING {type(self).__name__}({self.ident}) {i}', file=sys.stderr)
             self.int_w.write(b'x')
             self.int_w.flush()
         return i
 
     def do_interrupt(self, key):
         with self.int_cond:
-            print(f'{type(self).__name__}({self.ident}): INTERRUPTED', file=sys.stderr)
             try:
                 os.read(key.fd, 1)
             except Exception:
@@ -86,7 +84,6 @@ class IOThread(threading.Thread):
             self.selector.unregister(key.fd)
 
     def close(self):
-        print(f'{threading.get_ident()}: closing {type(self).__name__}({self.ident})', file=sys.stderr)
         if not self.shutdown:
             self.shutdown = True
             self.interrupt(False)
@@ -101,16 +98,13 @@ class IOThread(threading.Thread):
                     if event & selectors.EVENT_WRITE:
                         events.append('w')
                     events = ''.join(events)
-                    print(f'{type(self).__name__}({self.ident}): {key.fd}: {events}', file=sys.stderr)
                     key.data(key)
-        print(f'{type(self).__name__}({self.ident}): exit', file=sys.stderr)
 
     def __enter__(self):
         self.start()
         return self
 
     def __exit__(self, typ, val, tb):
-        self.close()
         self.join()
 
 
@@ -158,6 +152,12 @@ class ReadThread(IOThread):
                 os.close(sfd)
             except KeyError:
                 pass
+            else:
+                del self.sid_to_fd[self.sid]
+                del self.fd_to_sid[sfd]
+                if not self.sid_to_fd:
+                    self.close()
+                    return
             self.sid = None
             self.size = None
         else:
@@ -193,6 +193,9 @@ class ReadThread(IOThread):
                 pass
             sid = self.fd_to_sid.pop(key.fd)
             del self.sid_to_fd[sid]
+            if not self.sid_to_fd:
+                self.close()
+                return
         else:
             self.buf = self.buf[bytes_written:]
         if self.buf:
@@ -243,7 +246,6 @@ class WriteThread(IOThread):
                 fd, selectors.EVENT_READ, self.read_chunk)
 
     def read_chunk(self, key):
-        print('READ', file=sys.stderr)
         try:
             sid = self.fd_to_sid[key.fd]
         except KeyError:
@@ -252,7 +254,6 @@ class WriteThread(IOThread):
         if data:
             self.buf += CHUNK.pack(sid, len(data)) + data
         else:
-            print('CLOSE', file=sys.stderr)
             self.buf += CHUNK.pack(sid, 0)
             fd = self.sid_to_fd.pop(sid)
             del self.fd_to_sid[fd]
@@ -267,13 +268,16 @@ class WriteThread(IOThread):
         except BrokenPipeError:
             self.close()
             return
-        self.buf = self.buf[bytes_written:]
-        if not self.read_enabled and len(self.buf) < self.maxwrite:
-            self.enable_read()
-        if self.buf:
-            return
         with self.flush_cond:
+            self.buf = self.buf[bytes_written:]
+            if not self.read_enabled and len(self.buf) < self.maxwrite:
+                self.enable_read()
+            if self.buf:
+                return
             self.flush_cond.notify_all()
+            if not self.fd_to_sid:
+                self.close()
+                return
         self.write_enabled = False
         self.selector.unregister(key.fd)
 
@@ -294,14 +298,11 @@ class WriteThread(IOThread):
                 self.fd, selectors.EVENT_WRITE, self.write_chunk)
 
     def flush(self):
+        if self.shutdown:
+            return
         with self.flush_cond:
-            self.flush_cond.wait()
-
-    def __exit__(self, typ, val, tb):
-        for writer in self.reader_to_writer.values():
-            writer.close()
-        self.flush()
-        return super().__exit__(typ, val, tb)
+            if self.buf:
+                self.flush_cond.wait()
 
 
 if __name__ == '__pype__':
@@ -310,8 +311,9 @@ if __name__ == '__pype__':
         sys.stdout = writer.open(1, 'w')
         with ReadThread(sys.stdin) as reader:
             sys.stdin = reader.open(0, 'r')
-            msg = sys.stdin.read()
+            msg = sys.stdin.read().strip()
             print(f'hello: {msg}')
+        sys.stdout.close()
 
 
 elif __name__ == '__main__':
@@ -368,6 +370,5 @@ elif __name__ == '__main__':
             reader.set_stream(1, sys.stdout)
             with WriteThread(p.stdin) as writer:
                 writer.set_stream(0, sys.stdin)
-                writer.join()
 
     sys.exit(p.returncode)
