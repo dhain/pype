@@ -371,20 +371,25 @@ if __name__ == '__pype__':
     sys.argv.pop(0)
     with WriteThread(sys.stdout) as writer:
         sys.stdout = writer.open(1, 'w')
-        with ReadThread(sys.stdin) as reader:
-            sys.stdin = reader.open(0, 'r')
-            importer = RemoteImporter(reader, writer)
-            sys.meta_path.append(importer)
-            importer.exec_main()
-            importer.close()
-            reader.close()
-        sys.stdout.close()
+        try:
+            with ReadThread(sys.stdin) as reader:
+                sys.stdin = reader.open(0, 'r')
+                importer = RemoteImporter(reader, writer)
+                sys.meta_path.append(importer)
+                try:
+                    importer.exec_main()
+                finally:
+                    importer.close()
+                    reader.close()
+        finally:
+            sys.stdout.close()
 
 
 elif __name__ == '__main__':
     import shlex
     import argparse
     import subprocess
+    from importlib.util import find_spec
 
     parser = argparse.ArgumentParser(
         prog=sys.argv[0],
@@ -424,6 +429,8 @@ elif __name__ == '__main__':
     with opts.prog:
         prog = opts.prog.read()
 
+    sys.path.insert(0, os.path.dirname(opts.prog.name))
+
 
     class ImportResponder:
         sid = 250
@@ -433,6 +440,16 @@ elif __name__ == '__main__':
             self.out_stream = writer.open(self.sid, 'wb')
             self.modules = modules
 
+        def import_source(self, fullname):
+            spec = find_spec(fullname)
+            if not spec:
+                return b''
+            try:
+                source = spec.loader.get_source(fullname)
+            except ImportError:
+                return b''
+            return source.encode('utf-8')
+
         def run(self):
             try:
                 while True:
@@ -440,7 +457,10 @@ elif __name__ == '__main__':
                     if not fullname:
                         return
                     fullname = fullname.decode('utf-8').strip()
-                    source = self.modules.get(fullname, b'')
+                    try:
+                        source = self.modules[fullname]
+                    except KeyError:
+                        source = self.import_source(fullname)
                     self.out_stream.write(f'{len(source)}\n'.encode('utf-8'))
                     if source:
                         self.out_stream.write(source)
@@ -461,9 +481,11 @@ elif __name__ == '__main__':
             reader.set_stream(1, sys.stdout)
             with WriteThread(p.stdin) as writer:
                 writer.set_stream(0, sys.stdin)
-                ImportResponder(reader, writer, {
-                    '__main__': prog,
-                }).run()
-                writer.close()
+                try:
+                    ImportResponder(reader, writer, {
+                        '__main__': prog,
+                    }).run()
+                finally:
+                    writer.close()
 
     sys.exit(p.returncode)
