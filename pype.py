@@ -125,8 +125,7 @@ class ReadThread(IOThread):
         if sid in self.sid_to_fd:
             raise ValueError('stream already open')
         r, w = os.pipe()
-        self.sid_to_fd[sid] = w
-        self.fd_to_sid[w] = sid
+        self.set_stream(sid, w)
         return os.fdopen(r, *args, **kwargs)
 
     def set_stream(self, sid, fileobj):
@@ -227,11 +226,7 @@ class WriteThread(IOThread):
         if sid in self.sid_to_fd:
             raise ValueError('stream already open')
         r, w = os.pipe()
-        self.sid_to_fd[sid] = r
-        self.fd_to_sid[r] = sid
-        with self.interrupt():
-            self.selector.register(
-                r, selectors.EVENT_READ, self.read_chunk)
+        self.set_stream(sid, r)
         writer = self.reader_to_writer[r] = os.fdopen(w, *args, **kwargs)
         return writer
 
