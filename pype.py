@@ -31,6 +31,7 @@ def bootstrap():
 import selectors
 import threading
 import signal
+import pickle
 
 
 class ShutdownError(Exception):
@@ -300,10 +301,28 @@ class WriteThread(IOThread):
                 self.flush_cond.wait()
 
 
+def send_pickle(s, obj):
+    d = pickle.dumps(obj)
+    s.write(f'{len(d)}\n'.encode('ascii'))
+    s.write(d)
+    s.flush()
+
+
+def read_pickle(s):
+    remain = int(s.readline().strip())
+    buf = b''
+    while remain:
+        d = s.read(remain)
+        if not d:
+            raise BrokenPipeError()
+        remain -= len(d)
+        buf += d
+    return pickle.loads(buf)
+
+
 if __name__ == '__pype__':
     from importlib.abc import MetaPathFinder, Loader
-    from importlib.util import decode_source, module_from_spec
-    from importlib.machinery import ModuleSpec
+    from importlib.util import module_from_spec
 
 
     class RemoteImporter(MetaPathFinder, Loader):
@@ -312,46 +331,30 @@ if __name__ == '__pype__':
         def __init__(self, reader, writer):
             self.in_stream = reader.open(self.sid, 'rb')
             self.out_stream = writer.open(self.sid, 'wb')
-            self.modules = {}
-            self.lock = threading.Lock()
 
-        def _read_source(self, fullname):
-            self.out_stream.write(f'{fullname}\n'.encode('utf-8'))
-            self.out_stream.flush()
-            line = self.in_stream.readline()
-            if not line:
-                self.out_stream.close()
-                return None
-            try:
-                remaining = int(line.strip())
-            except ValueError:
-                self.out_stream.close()
-                return None
-            buf = b''
-            while remaining:
-                chunk = self.in_stream.read(remaining)
-                if not chunk:
-                    self.out_stream.close()
-                    return None
-                remaining -= len(chunk)
-                buf += chunk
-            if buf:
-                return decode_source(buf)
+        def _req(self, method, *args):
+            send_pickle(self.out_stream, (method, *args))
+            e, ret = read_pickle(self.in_stream)
+            if e:
+                raise e
+            return ret
 
-        def find_spec(self, fullname, path, target=None):
-            try:
-                source = self.modules[fullname]
-            except KeyError:
-                with self.lock:
-                    source = self.modules[fullname] = self._read_source(fullname)
-            if source:
-                return ModuleSpec(fullname, self)
+        def find_spec(self, name, path, target=None):
+            spec = self._req('find_spec', name, path)
+            if spec:
+                spec.loader = self
+            return spec
+
+        def get_source(self, fullname):
+            return self._req('get_source', fullname)
+
+        def get_code(self, fullname):
+            source = self.get_source(fullname)
+            return compile(source, f'<remote: {fullname}>', 'exec')
 
         def exec_module(self, module):
-            fullname = module.__name__
-            source = self.modules[fullname]
-            compiled = compile(source, f'<remote: {fullname}>', 'exec')
-            exec(compiled, module.__dict__)
+            code = self.get_code(module.__name__)
+            exec(code, module.__dict__)
 
         def exec_main(self):
             spec = self.find_spec('__main__', None)
@@ -384,7 +387,8 @@ elif __name__ == '__main__':
     import shlex
     import argparse
     import subprocess
-    from importlib.util import find_spec
+    from importlib.util import find_spec, decode_source
+    from importlib.machinery import ModuleSpec
 
     parser = argparse.ArgumentParser(
         prog=sys.argv[0],
@@ -422,7 +426,7 @@ elif __name__ == '__main__':
     cmd = shlex.join([opts.python, '-c', BOOTSTRAP, opts.prog.name] + opts.args)
 
     with opts.prog:
-        prog = opts.prog.read()
+        prog = decode_source(opts.prog.read())
 
     sys.path.insert(0, os.path.dirname(opts.prog.name))
 
@@ -435,31 +439,32 @@ elif __name__ == '__main__':
             self.out_stream = writer.open(self.sid, 'wb')
             self.modules = modules
 
-        def import_source(self, fullname):
-            spec = find_spec(fullname)
-            if not spec:
-                return b''
+        def find_spec(self, name, path):
+            if name in self.modules:
+                spec = ModuleSpec(name, None)
+            else:
+                spec = find_spec(name, path)
+            if spec:
+                spec.loader = None
+            return spec
+
+        def get_source(self, name):
             try:
-                source = spec.loader.get_source(fullname)
-            except ImportError:
-                return b''
-            return source.encode('utf-8')
+                return self.modules[name]
+            except KeyError:
+                spec = find_spec(name)
+                return spec.loader.get_source(name)
 
         def run(self):
             try:
                 while True:
-                    fullname = self.in_stream.readline()
-                    if not fullname:
-                        return
-                    fullname = fullname.decode('utf-8').strip()
+                    method, *args = read_pickle(self.in_stream)
                     try:
-                        source = self.modules[fullname]
-                    except KeyError:
-                        source = self.import_source(fullname)
-                    self.out_stream.write(f'{len(source)}\n'.encode('utf-8'))
-                    if source:
-                        self.out_stream.write(source)
-                    self.out_stream.flush()
+                        ret = getattr(self, method)(*args)
+                    except Exception as e:
+                        send_pickle(self.out_stream, (e, None))
+                    else:
+                        send_pickle(self.out_stream, (None, ret))
             finally:
                 self.out_stream.close()
                 self.in_stream.close()
