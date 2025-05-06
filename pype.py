@@ -80,8 +80,14 @@ class IOThread(threading.Thread):
             w = self.int_w
             self.int_w = None
             self.int_r = None
-            w.close()
-            os.close(key.fd)
+            try:
+                w.close()
+            except Exception:
+                pass
+            try:
+                os.close(key.fd)
+            except Exception:
+                pass
             self.selector.unregister(key.fd)
 
     def close(self):
@@ -299,6 +305,12 @@ class WriteThread(IOThread):
         with self.flush_cond:
             if self.buf:
                 self.flush_cond.wait()
+            self.stream.flush()
+
+    def close(self):
+        self.flush()
+        self.stream.close()
+        return super().close()
 
 
 def send_pickle(s, obj):
@@ -309,7 +321,10 @@ def send_pickle(s, obj):
 
 
 def read_pickle(s):
-    remain = int(s.readline().strip())
+    try:
+        remain = int(s.readline().strip())
+    except ValueError:
+        raise BrokenPipeError()
     buf = b''
     while remain:
         d = s.read(remain)
@@ -369,6 +384,7 @@ if __name__ == '__pype__':
     sys.argv.pop(0)
     with WriteThread(sys.stdout) as writer:
         sys.stdout = writer.open(1, 'w')
+        sys.stderr = writer.open(2, 'w')
         try:
             with ReadThread(sys.stdin) as reader:
                 sys.stdin = reader.open(0, 'r')
@@ -380,7 +396,9 @@ if __name__ == '__pype__':
                     importer.close()
                     reader.close()
         finally:
+            writer.flush()
             sys.stdout.close()
+            sys.stderr.close()
 
 
 elif __name__ == '__main__':
@@ -479,6 +497,7 @@ elif __name__ == '__main__':
         p.stdin.flush()
         with ReadThread(p.stdout) as reader:
             reader.set_stream(1, sys.stdout)
+            reader.set_stream(2, sys.stderr)
             with WriteThread(p.stdin) as writer:
                 writer.set_stream(0, sys.stdin)
                 try:
