@@ -39,72 +39,76 @@ class ShutdownError(Exception):
 
 
 class Interruptor:
-    def __init__(self, cond):
-        self.cond = cond
-        self.cond.acquire()
+    def __init__(self):
+        self.r, self.w = os.pipe()
 
-    def __enter__(self):
-        self.cond.wait()
+    def fileno(self):
+        return self.r
 
-    def __exit__(self, typ, val, tb):
-        self.cond.release()
+    def close(self):
+        try:
+            os.close(self.w)
+        except Exception:
+            pass
+        try:
+            os.close(self.r)
+        except Exception:
+            pass
+
+    def interrupt(self):
+        while not os.write(self.w, b'x'):
+            pass
+
+    def ack(self):
+        try:
+            os.read(self.r, 1)
+        except Exception:
+            pass
 
 
 class IOThread(threading.Thread):
     def __init__(self):
         super().__init__()
         self.shutdown = False
-        self.int_r, self.int_w = os.pipe()
-        self.int_w = os.fdopen(self.int_w, 'wb')
-        self.int_cond = threading.Condition()
+        self.interruptor = Interruptor()
         self.selector = selectors.DefaultSelector()
         self.selector.register(
-            self.int_r, selectors.EVENT_READ, self.do_interrupt)
+            self.interruptor, selectors.EVENT_READ, self.handle_interrupt)
 
-    def interrupt(self, wait=True):
-        i = Interruptor(self.int_cond) if wait else None
-        if self.int_w:
-            self.int_w.write(b'x')
-            self.int_w.flush()
-        return i
+    def _unreg_fd(self, fd):
+        try:
+            self.selector.unregister(fd)
+        except KeyError:
+            pass
 
-    def do_interrupt(self, key):
-        with self.int_cond:
-            try:
-                os.read(key.fd, 1)
-            except Exception:
-                pass
-            self.int_cond.notify_all()
+    def _close_fd(self, fd):
+        self._unreg_fd(fd)
+        try:
+            os.close(fd)
+        except Exception:
+            pass
 
+    def interrupt(self):
+        self.interruptor.interrupt()
+
+    def handle_interrupt(self, _):
+        self.interruptor.ack()
         if self.shutdown:
-            w = self.int_w
-            self.int_w = None
-            self.int_r = None
-            try:
-                w.close()
-            except Exception:
-                pass
-            try:
-                os.close(key.fd)
-            except Exception:
-                pass
-            self.selector.unregister(key.fd)
+            self._unreg_fd(self.interruptor)
+            self.interruptor.close()
+            self.interruptor = None
 
     def close(self):
-        if not self.shutdown:
-            self.shutdown = True
-            self.interrupt(False)
+        self.shutdown = True
+        try:
+            self.interrupt()
+        except Exception:
+            pass
 
     def run(self):
         with self.selector:
             while not self.shutdown and self.selector.get_map():
                 for key, event in self.selector.select():
-                    events = []
-                    if event & selectors.EVENT_READ:
-                        events.append('r')
-                    if event & selectors.EVENT_WRITE:
-                        events.append('w')
-                    events = ''.join(events)
                     key.data(key)
 
     def __enter__(self):
@@ -115,7 +119,7 @@ class IOThread(threading.Thread):
         self.join()
 
 
-class ReadThread(IOThread):
+class DemuxThread(IOThread):
     def __init__(self, stream):
         super().__init__()
         self.stream = stream
@@ -125,8 +129,17 @@ class ReadThread(IOThread):
         self.buf = b''
         self.sid = None
         self.size = None
+        self.flush_cond = threading.Condition()
         self.selector.register(
             self.fd, selectors.EVENT_READ, self.read_chunk_header)
+
+    def close(self):
+        self._unreg_fd(self.fd)
+        self.stream.close()
+        self.flush()
+        for sid in list(self.sid_to_fd):
+            self.close_stream(sid)
+        return super().close()
 
     def open(self, sid, *args, **kwargs):
         if sid in self.sid_to_fd:
@@ -142,39 +155,46 @@ class ReadThread(IOThread):
         self.sid_to_fd[sid] = fd
         self.fd_to_sid[fd] = sid
 
-    def read_chunk_header(self, key):
-        data = os.read(key.fd, CHUNK.size - len(self.buf))
-        if not data:
-            self.close()
+    def close_stream(self, sid):
+        try:
+            sfd = self.sid_to_fd.pop(sid)
+        except KeyError:
             return
+        self._close_fd(sfd)
+        try:
+            del self.fd_to_sid[sfd]
+        except KeyError:
+            pass
+
+    def read_chunk_header(self, _):
+        try:
+            data = os.read(self.fd, CHUNK.size - len(self.buf))
+        except OSError:
+            data = b''
+        if not data:
+            return self.close()
         self.buf += data
         if len(self.buf) < CHUNK.size:
             return
         self.sid, self.size = CHUNK.unpack(self.buf)
         self.buf = b''
         if self.size == 0:
-            try:
-                sfd = self.sid_to_fd[self.sid]
-            except KeyError:
-                pass
-            else:
-                os.close(sfd)
-                del self.fd_to_sid[sfd]
-                del self.sid_to_fd[self.sid]
-                if not self.sid_to_fd:
-                    self.close()
-                    return
+            self.close_stream(self.sid)
+            if not self.sid_to_fd:
+                return self.close()
             self.sid = None
             self.size = None
         else:
             self.selector.modify(
-                key.fd, selectors.EVENT_READ, self.read_chunk)
+                self.fd, selectors.EVENT_READ, self.read_chunk)
 
-    def read_chunk(self, key):
-        data = os.read(key.fd, self.size - len(self.buf))
+    def read_chunk(self, _):
+        try:
+            data = os.read(self.fd, self.size - len(self.buf))
+        except OSError:
+            data = b''
         if not data:
-            self.close()
-            return
+            return self.close()
         self.buf += data
         if len(self.buf) < self.size:
             return
@@ -182,38 +202,47 @@ class ReadThread(IOThread):
             sfd = self.sid_to_fd[self.sid]
         except KeyError:
             self.selector.modify(
-                key.fd, selectors.EVENT_READ, self.read_chunk_header)
+                self.fd, selectors.EVENT_READ, self.read_chunk_header)
         else:
-            self.selector.unregister(key.fd)
+            self._unreg_fd(self.fd)
             self.selector.register(
                 sfd, selectors.EVENT_WRITE, self.write_chunk)
 
     def write_chunk(self, key):
         try:
             bytes_written = os.write(key.fd, self.buf)
-        except BrokenPipeError:
+        except OSError:
             self.buf = b''
+            self._close_fd(key.fd)
             try:
-                os.close(key.fd)
-            except Exception:
+                sid = self.fd_to_sid.pop(key.fd)
+            except KeyError:
                 pass
-            sid = self.fd_to_sid.pop(key.fd)
-            del self.sid_to_fd[sid]
+            else:
+                del self.sid_to_fd[sid]
             if not self.sid_to_fd:
-                self.close()
-                return
+                return self.close()
         else:
             self.buf = self.buf[bytes_written:]
-        if self.buf:
+        with self.flush_cond:
+            if self.buf:
+                return
+            self.sid = None
+            self.size = None
+            self._unreg_fd(key.fd)
+            self.selector.register(
+                self.fd, selectors.EVENT_READ, self.read_chunk_header)
+            self.flush_cond.notify_all()
+
+    def flush(self):
+        if self.shutdown:
             return
-        self.sid = None
-        self.size = None
-        self.selector.unregister(key.fd)
-        self.selector.register(
-            self.fd, selectors.EVENT_READ, self.read_chunk_header)
+        with self.flush_cond:
+            if self.buf:
+                self.flush_cond.wait()
 
 
-class WriteThread(IOThread):
+class MuxThread(IOThread):
     maxread = 1024
     maxwrite = 10240
 
@@ -229,6 +258,14 @@ class WriteThread(IOThread):
         self.read_enabled = True
         self.flush_cond = threading.Condition()
 
+    def close(self):
+        for sid in list(self.sid_to_fd):
+            self.close_stream(sid)
+        self.flush()
+        self._unreg_fd(self.fd)
+        self.stream.close()
+        return super().close()
+
     def open(self, sid, *args, **kwargs):
         if sid in self.sid_to_fd:
             raise ValueError('stream already open')
@@ -243,33 +280,47 @@ class WriteThread(IOThread):
         fd = fileobj if isinstance(fileobj, int) else fileobj.fileno()
         self.sid_to_fd[sid] = fd
         self.fd_to_sid[fd] = sid
-        with self.interrupt():
-            self.selector.register(
-                fd, selectors.EVENT_READ, self.read_chunk)
+        self.selector.register(
+            fd, selectors.EVENT_READ, self.read_chunk)
+        self.interrupt()
+
+    def close_stream(self, sid):
+        try:
+            sfd = self.sid_to_fd.pop(sid)
+        except KeyError:
+            return
+        self._close_fd(sfd)
+        self.append_buf(sid, b'')
+        try:
+            del self.fd_to_sid[sfd]
+        except KeyError:
+            pass
+
+    def append_buf(self, sid, data):
+        self.buf += CHUNK.pack(sid, len(data)) + data
+        if len(self.buf) > self.maxwrite:
+            self.disable_read()
+        self.enable_write()
 
     def read_chunk(self, key):
         try:
             sid = self.fd_to_sid[key.fd]
         except KeyError:
-            return
-        data = os.read(key.fd, self.maxread)
-        if data:
-            self.buf += CHUNK.pack(sid, len(data)) + data
-        else:
-            self.buf += CHUNK.pack(sid, 0)
-            fd = self.sid_to_fd.pop(sid)
-            del self.fd_to_sid[fd]
-            self.selector.unregister(fd)
-        if len(self.buf) > self.maxwrite:
-            self.disable_read()
-        self.enable_write()
-
-    def write_chunk(self, key):
+            return self._unreg_fd(key.fd)
         try:
-            bytes_written = os.write(key.fd, self.buf)
-        except BrokenPipeError:
-            self.close()
-            return
+            data = os.read(key.fd, self.maxread)
+        except OSError:
+            return self.close_stream(sid)
+        if data:
+            self.append_buf(sid, data)
+        else:
+            self.close_stream(sid)
+
+    def write_chunk(self, _):
+        try:
+            bytes_written = os.write(self.fd, self.buf)
+        except OSError:
+            return self.close()
         with self.flush_cond:
             self.buf = self.buf[bytes_written:]
             if not self.read_enabled and len(self.buf) < self.maxwrite:
@@ -277,11 +328,8 @@ class WriteThread(IOThread):
             if self.buf:
                 return
             self.flush_cond.notify_all()
-            if not self.fd_to_sid:
-                self.close()
-                return
+        self._unreg_fd(self.fd)
         self.write_enabled = False
-        self.selector.unregister(key.fd)
 
     def enable_read(self):
         self.read_enabled = True
@@ -291,7 +339,7 @@ class WriteThread(IOThread):
 
     def disable_read(self):
         for fd in self.fd_to_sid:
-            self.selector.unregister(fd)
+            self._unreg_fd(fd)
 
     def enable_write(self):
         if not self.write_enabled:
@@ -305,12 +353,6 @@ class WriteThread(IOThread):
         with self.flush_cond:
             if self.buf:
                 self.flush_cond.wait()
-            self.stream.flush()
-
-    def close(self):
-        self.flush()
-        self.stream.close()
-        return super().close()
 
 
 def send_pickle(s, obj):
@@ -343,9 +385,9 @@ if __name__ == '__pype__':
     class RemoteImporter(MetaPathFinder, Loader):
         sid = 250
 
-        def __init__(self, reader, writer):
-            self.in_stream = reader.open(self.sid, 'rb')
-            self.out_stream = writer.open(self.sid, 'wb')
+        def __init__(self, demux, mux):
+            self.in_stream = demux.open(self.sid, 'rb')
+            self.out_stream = mux.open(self.sid, 'wb')
 
         def _req(self, method, *args):
             send_pickle(self.out_stream, (method, *args))
@@ -382,23 +424,24 @@ if __name__ == '__pype__':
 
 
     sys.argv.pop(0)
-    with WriteThread(sys.stdout) as writer:
-        sys.stdout = writer.open(1, 'w')
-        sys.stderr = writer.open(2, 'w')
+    with MuxThread(sys.stdout) as mux:
         try:
-            with ReadThread(sys.stdin) as reader:
-                sys.stdin = reader.open(0, 'r')
-                importer = RemoteImporter(reader, writer)
-                sys.meta_path.append(importer)
+            sys.stdout = mux.open(1, 'w')
+            with DemuxThread(sys.stdin) as demux:
+                sys.stdin = demux.open(0, 'r')
                 try:
-                    importer.exec_main()
+                    importer = RemoteImporter(demux, mux)
+                    try:
+                        sys.meta_path.append(importer)
+                        importer.exec_main()
+                    finally:
+                        importer.close()
+                        sys.stdout.close()
+                        sys.stderr.close()
                 finally:
-                    importer.close()
-                    reader.close()
+                    demux.close()
         finally:
-            writer.flush()
-            sys.stdout.close()
-            sys.stderr.close()
+            mux.close()
 
 
 elif __name__ == '__main__':
@@ -452,9 +495,9 @@ elif __name__ == '__main__':
     class ImportResponder:
         sid = 250
 
-        def __init__(self, reader, writer, modules):
-            self.in_stream = reader.open(self.sid, 'rb')
-            self.out_stream = writer.open(self.sid, 'wb')
+        def __init__(self, demux, mux, modules):
+            self.in_stream = demux.open(self.sid, 'rb')
+            self.out_stream = mux.open(self.sid, 'wb')
             self.modules = modules
 
         def find_spec(self, name, path):
@@ -476,7 +519,10 @@ elif __name__ == '__main__':
         def run(self):
             try:
                 while True:
-                    method, *args = read_pickle(self.in_stream)
+                    try:
+                        method, *args = read_pickle(self.in_stream)
+                    except BrokenPipeError:
+                        return
                     try:
                         ret = getattr(self, method)(*args)
                     except Exception as e:
@@ -495,16 +541,19 @@ elif __name__ == '__main__':
     ) as p:
         p.stdin.write(PYPE)
         p.stdin.flush()
-        with ReadThread(p.stdout) as reader:
-            reader.set_stream(1, sys.stdout)
-            reader.set_stream(2, sys.stderr)
-            with WriteThread(p.stdin) as writer:
-                writer.set_stream(0, sys.stdin)
-                try:
-                    ImportResponder(reader, writer, {
-                        '__main__': prog,
-                    }).run()
-                finally:
-                    writer.close()
+        with DemuxThread(p.stdout) as demux:
+            try:
+                demux.set_stream(1, sys.stdout)
+                with MuxThread(p.stdin) as mux:
+                    try:
+                        mux.set_stream(0, sys.stdin)
+                        ImportResponder(demux, mux, {
+                            '__main__': prog,
+                        }).run()
+                    finally:
+                        mux.close()
+                sys.stderr.flush()
+            finally:
+                demux.close()
 
     sys.exit(p.returncode)
