@@ -30,7 +30,6 @@ def bootstrap():
 
 import selectors
 import threading
-import signal
 import pickle
 
 
