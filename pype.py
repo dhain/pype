@@ -48,7 +48,7 @@ class PartialUnpickler(pickle.Unpickler):
         super().__init__(self.__partial_buf, *args, **kwargs)
 
     def load(self):
-        data = self.__file_read1()
+        data = self.__file_read1(4096)
         if data is None:
             raise NeedMore
         if not data:
@@ -173,7 +173,7 @@ class MuxDemux:
                                 self._interruptor.ack()
                                 continue
                             f = key.fileobj
-                            data = f.read1()
+                            data = f.read1(4096)
                             try:
                                 pickler.dump((sid, data))
                                 self.muxout.flush()
@@ -447,6 +447,7 @@ if __name__ == '__main__':
     ) as p:
         pickle.dump('__pype__', p.stdin)
         pickle.dump(PYPE, p.stdin)
+        p.stdin.flush()
         with MuxDemux(p.stdout, p.stdin) as m:
             m.set_mux(0, sys.stdin.buffer)
             m.set_demux(1, sys.stdout.buffer)
