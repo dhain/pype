@@ -2,11 +2,12 @@ import os
 import io
 import sys
 import types
+from struct import pack, unpack
 import pickle
 import threading
 import selectors
 from importlib.machinery import ModuleSpec
-from importlib.abc import MetaPathFinder, Loader
+from importlib.abc import MetaPathFinder, ExecutionLoader
 from importlib.util import module_from_spec, find_spec, decode_source
 
 
@@ -33,36 +34,66 @@ def close_all(files):
             f.close()
 
 
-def pp():
-    return os.getpid()
-
-
 class NeedMore(Exception):
     pass
 
 
-class PartialUnpickler(pickle.Unpickler):
-    def __init__(self, file, *args, **kwargs):
-        self.__file_read1 = file.read1
-        self.__partial_buf = io.BytesIO()
-        super().__init__(self.__partial_buf, *args, **kwargs)
+class Framer:
+    def __init__(self, stream):
+        self.stream = stream
+        self.buf = io.BytesIO()
 
-    def load(self):
-        data = self.__file_read1(4096)
+    def write(self, data):
+        self.buf.write(data)
+
+    def commit(self):
+        data = self.buf.getvalue()
+        size = len(data)
+        self.stream.write(pack('<Q', size))
+        self.stream.write(data)
+        self.stream.flush()
+        self.buf = io.BytesIO()
+
+
+class Unframer:
+    def __init__(self, stream):
+        self.stream = stream
+        self.buf = io.BytesIO()
+        self.size = None
+
+    def _read(self, needed):
+        to_read = min(needed - self.buf.tell(), 4096)
+        data = self.stream.read1(to_read)
         if data is None:
             raise NeedMore
         if not data:
             raise EOFError
-        self.__partial_buf.write(data)
-        if pickle.STOP[0] in data:
-            self.__partial_buf.seek(0)
-            obj = super().load()
-            after = self.__partial_buf.read()
-            self.__partial_buf.seek(0)
-            self.__partial_buf.write(after)
-            self.__partial_buf.truncate()
-            return obj
-        raise NeedMore
+        self.buf.write(data)
+        if self.buf.tell() < needed:
+            raise NeedMore
+
+    def load(self):
+        has_read = False
+        if self.size is None:
+            if self.buf.tell() < 8:
+                has_read = True
+                self._read(12)
+            self.buf.seek(0)
+            self.size, = unpack('<Q', self.buf.read(8))
+            after = self.buf.read()
+            self.buf = io.BytesIO()
+            self.buf.write(after)
+        if self.buf.tell() < self.size:
+            if has_read:
+                raise NeedMore
+            self._read(self.size)
+        self.buf.seek(0)
+        data = self.buf.read(self.size)
+        after = self.buf.read()
+        self.buf = io.BytesIO()
+        self.buf.write(after)
+        self.size = None
+        return data
 
 
 class IntCtx:
@@ -158,7 +189,7 @@ class MuxDemux:
 
     def run_mux(self):
         try:
-            pickler = pickle.Pickler(self.muxout)
+            framer = Framer(self.muxout)
             with self._interruptor.register() as int_fd:
                 with self._mux_cond:
                     selector = self._mux_selector = selectors.DefaultSelector()
@@ -175,8 +206,8 @@ class MuxDemux:
                             f = key.fileobj
                             data = f.read1(4096)
                             try:
-                                pickler.dump((sid, data))
-                                self.muxout.flush()
+                                framer.write(pickle.dumps((sid, data)))
+                                framer.commit()
                             except BrokenPipeError:
                                 return
                             if not data:
@@ -208,7 +239,7 @@ class MuxDemux:
 
     def run_demux(self):
         try:
-            unpickler = PartialUnpickler(self.muxin)
+            unframer = Unframer(self.muxin)
             with self._demux_mutex:
                 self._demux_fds = {}
             set_nonblocking(self.muxin)
@@ -225,7 +256,7 @@ class MuxDemux:
                                 self._interruptor.ack()
                                 continue
                             try:
-                                sid, data = unpickler.load()
+                                sid, data = pickle.loads(unframer.load())
                             except NeedMore:
                                 continue
                             except EOFError:
@@ -282,20 +313,26 @@ class MuxDemux:
                 self._thread_died.wait()
 
 
-class RemoteImporter(MetaPathFinder, Loader):
+class RemoteImporter(MetaPathFinder, ExecutionLoader):
     sid = 250
 
     def __init__(self, muxdemux):
         self.muxdemux = muxdemux
         self.in_stream = open(muxdemux.demux_open(self.sid), 'rb')
         self.out_stream = open(muxdemux.mux_open(self.sid), 'wb')
-        self.pickle_in = pickle.Unpickler(self.in_stream)
-        self.pickle_out = pickle.Pickler(self.out_stream)
+        self.framer = Framer(self.out_stream)
+        self.unframer = Unframer(self.in_stream)
 
     def _req(self, method, *args):
-        self.pickle_out.dump((method, *args))
-        self.out_stream.flush()
-        e, ret = self.pickle_in.load()
+        self.framer.write(pickle.dumps((method, *args)))
+        self.framer.commit()
+        while True:
+            try:
+                data = self.unframer.load()
+            except NeedMore:
+                continue
+            break
+        e, ret = pickle.loads(data)
         if e:
             raise e
         return ret
@@ -306,16 +343,18 @@ class RemoteImporter(MetaPathFinder, Loader):
             spec.loader = self
         return spec
 
+    def is_package(self, fullname):
+        p = self._req('is_package', fullname)
+        return p
+
     def get_source(self, fullname):
         return self._req('get_source', fullname)
 
-    def get_code(self, fullname):
-        source = self.get_source(fullname)
-        return compile(source, f'<remote: {fullname}>', 'exec')
-
     def exec_module(self, module):
-        code = self.get_code(module.__name__)
-        exec(code, module.__dict__)
+        return super().exec_module(module)
+
+    def get_filename(self, fullname):
+        return f'<remote: {fullname}>'
 
     def exec_main(self):
         spec = self.find_spec('__main__', None)
@@ -334,8 +373,6 @@ class ImportResponder:
         self.muxdemux = muxdemux
         self.in_stream = open(muxdemux.demux_open(self.sid), 'rb')
         self.out_stream = open(muxdemux.mux_open(self.sid), 'wb')
-        self.pickle_in = pickle.Unpickler(self.in_stream)
-        self.pickle_out = pickle.Pickler(self.out_stream)
         self.modules = modules
 
     def find_spec(self, name, path):
@@ -347,27 +384,39 @@ class ImportResponder:
             spec.loader = None
         return spec
 
-    def get_source(self, name):
-        try:
-            return self.modules[name]
-        except KeyError:
-            spec = find_spec(name)
-            return spec.loader.get_source(name)
+    def is_package(self, fullname):
+        if fullname in self.modules:
+            return False
+        spec = find_spec(fullname)
+        return spec.loader.is_package(fullname)
+
+    def get_source(self, fullname):
+        if fullname in self.modules:
+            src = self.modules[fullname]
+        else:
+            spec = find_spec(fullname)
+            src = spec.loader.get_source(fullname)
+        return src
 
     def run(self):
+        framer = Framer(self.out_stream)
+        unframer = Unframer(self.in_stream)
         try:
             while True:
                 try:
-                    method, *args = self.pickle_in.load()
-                except (BrokenPipeError, EOFError):
+                    data = unframer.load()
+                except NeedMore:
+                    continue
+                except EOFError:
                     return
+                method, *args = pickle.loads(data)
                 try:
                     ret = getattr(self, method)(*args)
                 except Exception as e:
-                    self.pickle_out.dump((e, None))
+                    framer.write(pickle.dumps((e, None)))
                 else:
-                    self.pickle_out.dump((None, ret))
-                self.out_stream.flush()
+                    framer.write(pickle.dumps((None, ret)))
+                framer.commit()
         finally:
             self.out_stream.close()
             self.in_stream.close()
@@ -434,6 +483,8 @@ if __name__ == '__main__':
                 opts.main = decode_source(f.read())
     else:
         opts.main = 'import code; code.interact()'
+
+    sys.path.insert(0, os.getcwd())
 
     args = ' '.join(shlex.quote(a) for a in [
         opts.python, '-c', CMD
